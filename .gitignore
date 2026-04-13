@@ -2,4 +2,4 @@
 /.env.example
 /node_modules
 /package-lock.json
-/attendance.db
+attendance.db
