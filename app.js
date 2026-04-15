@@ -259,23 +259,26 @@ async function sendAttendanceTelegram(message, employeeId, employeeName) {
     const chatIds = resolveAttendanceChatIds(employeeId, employeeName);
     if (chatIds.length === 0) {
         console.warn(`Telegram warning: no target chat for ${employeeName || 'Unknown'} (${employeeId || 'Unknown'})`);
-        return;
+        return false;
     }
+    let sentCount = 0;
     for (const chatId of chatIds) {
         try {
             await axios.post(
                 `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
                 { chat_id: chatId, text: message, parse_mode: 'HTML' }
             );
+            sentCount += 1;
         } catch (err) {
             console.error(`Telegram error (chat ${chatId}):`, err.message);
         }
     }
+    return sentCount > 0;
 }
 
 async function sendAttendanceTelegramByEmployeeId(message, employeeId) {
     const fallbackName = EMPLOYEE_SHIFT_MAP[String(employeeId)]?.name || '';
-    await sendAttendanceTelegram(message, employeeId, fallbackName);
+    return sendAttendanceTelegram(message, employeeId, fallbackName);
 }
 
 async function sendTelegramToChat(chatId, message) {
@@ -844,14 +847,6 @@ async function handleEvent(data) {
         `🕒 Time: ${timeStr}`;
 
     if (checkType === 'breakIn') {
-        await appendEventToGoogleSheet(buildSheetRow({
-            timeLocal: timeStr,
-            employeeId,
-            employeeName,
-            action: 'Break In',
-            shiftTime: formatShiftTime(configuredShift),
-            shiftDate
-        }), targetSheet);
         // Break notifications are intentionally disabled for now.
         // const duration = getBreakDuration(employeeId);
         // let message = `🔙 <b>Break In</b>\n${baseMessage}`;
@@ -861,14 +856,6 @@ async function handleEvent(data) {
         return;
     }
     if (checkType === 'breakOut') {
-        await appendEventToGoogleSheet(buildSheetRow({
-            timeLocal: timeStr,
-            employeeId,
-            employeeName,
-            action: 'Break Out',
-            shiftTime: formatShiftTime(configuredShift),
-            shiftDate
-        }), targetSheet);
         // Break notifications are intentionally disabled for now.
         // await sendTelegram(`☕ <b>Break Out</b>\n${baseMessage}`);
         // console.log(`✅ SENT: Break Out — ${employeeName} (${employeeId})`);
@@ -876,13 +863,6 @@ async function handleEvent(data) {
     }
 
     if (!configuredShift) {
-        await appendEventToGoogleSheet(buildSheetRow({
-            timeLocal: timeStr,
-            employeeId,
-            employeeName,
-            action: statusRawOriginal || checkType || 'Access Event',
-            shiftDate
-        }), targetSheet);
         // Unknown/unmapped users and generic access events are intentionally muted.
         // const fallbackStatus = statusMap[checkType] || status;
         // await sendTelegram(`${fallbackStatus.emoji} <b>${fallbackStatus.label}</b>\n${baseMessage}`);
@@ -941,18 +921,20 @@ async function handleEvent(data) {
         if (didntComeFlag) msg += `\n🚫 Marked as: <b>Did Not Come</b>\n⏱ Late by: <b>${lateMin} min</b>`;
         else if (lateFlag) msg += `\n🚨 Late by: <b>${lateMin} min</b>`;
         else msg += `\n🟢 On time (within ${ON_TIME_GRACE_MIN} min grace)`;
-        await sendAttendanceTelegram(msg, employeeId, employeeName);
-        await appendEventToGoogleSheet(buildSheetRow({
-            timeLocal: timeStr,
-            employeeId,
-            employeeName,
-            action: didntComeFlag ? `Did Not Come (Checked In >${VERY_LATE_AFTER_MIN}m)` : (lateFlag ? 'Late Check In' : 'On-Time Check In'),
-            shiftTime: formatShiftTime(configuredShift),
-            shiftDate,
-            lateMinutes: lateMin,
-            didntCome: didntComeFlag
-        }), targetSheet);
-        console.log(`✅ SENT: first check-in (${didntComeFlag ? 'did-not-come' : (lateFlag ? 'late' : 'on-time')}) — ${employeeName} (${employeeId})`);
+        const sent = await sendAttendanceTelegram(msg, employeeId, employeeName);
+        if (sent) {
+            await appendEventToGoogleSheet(buildSheetRow({
+                timeLocal: timeStr,
+                employeeId,
+                employeeName,
+                action: didntComeFlag ? `Did Not Come (Checked In >${VERY_LATE_AFTER_MIN}m)` : (lateFlag ? 'Late Check In' : 'On-Time Check In'),
+                shiftTime: formatShiftTime(configuredShift),
+                shiftDate,
+                lateMinutes: lateMin,
+                didntCome: didntComeFlag
+            }), targetSheet);
+            console.log(`✅ SENT: first check-in (${didntComeFlag ? 'did-not-come' : (lateFlag ? 'late' : 'on-time')}) — ${employeeName} (${employeeId})`);
+        }
         return;
     }
 
@@ -973,16 +955,18 @@ async function handleEvent(data) {
         if (dayRow && dayRow.first_check_in_at) {
             msg += `\n⏱ Worked: <b>${formatWorkedDuration(dayRow.first_check_in_at, eventTime, shiftDate, configuredShift)}</b>`;
         }
-        await sendAttendanceTelegram(msg, employeeId, employeeName);
-        await appendEventToGoogleSheet(buildSheetRow({
-            timeLocal: timeStr,
-            employeeId,
-            employeeName,
-            action: 'Check Out',
-            shiftTime: formatShiftTime(configuredShift),
-            shiftDate
-        }), targetSheet);
-        console.log(`✅ SENT: check-out — ${employeeName} (${employeeId})`);
+        const sent = await sendAttendanceTelegram(msg, employeeId, employeeName);
+        if (sent) {
+            await appendEventToGoogleSheet(buildSheetRow({
+                timeLocal: timeStr,
+                employeeId,
+                employeeName,
+                action: 'Check Out',
+                shiftTime: formatShiftTime(configuredShift),
+                shiftDate
+            }), targetSheet);
+            console.log(`✅ SENT: check-out — ${employeeName} (${employeeId})`);
+        }
         return;
     }
 }
@@ -1020,7 +1004,7 @@ async function runNoShowCheck() {
 
         const name = info.name || 'Unknown';
         const targetSheet = getGoogleSheetTargetForEmployee(employeeId, name);
-        await sendAttendanceTelegramByEmployeeId(
+        const sent = await sendAttendanceTelegramByEmployeeId(
             `🚫 <b>No Show Alert</b>\n` +
             `👤 Name: ${name}\n` +
             `🆔 ID: ${employeeId}\n` +
@@ -1029,16 +1013,18 @@ async function runNoShowCheck() {
             `⏱ No check-in received within ${VERY_LATE_AFTER_MIN} minutes of shift start`,
             employeeId
         );
-        await appendEventToGoogleSheet(buildSheetRow({
-            timeLocal: formatDateTimeInZone(now),
-            employeeId,
-            employeeName: name,
-            action: 'Did Not Come (No Check In)',
-            shiftTime: formatShiftTime(shift),
-            shiftDate: today,
-            didntCome: true
-        }), targetSheet);
-        console.log(`🚫 SENT: no-show alert — ${name} (${employeeId})`);
+        if (sent) {
+            await appendEventToGoogleSheet(buildSheetRow({
+                timeLocal: formatDateTimeInZone(now),
+                employeeId,
+                employeeName: name,
+                action: 'Did Not Come (No Check In)',
+                shiftTime: formatShiftTime(shift),
+                shiftDate: today,
+                didntCome: true
+            }), targetSheet);
+            console.log(`🚫 SENT: no-show alert — ${name} (${employeeId})`);
+        }
     }
 }
 
@@ -1082,7 +1068,7 @@ async function runBreakOvertimeCheck() {
         `).run(employeeId, lastBreakEvent.timestamp, now.toISOString());
 
         const name = lastBreakEvent.employee_name || EMPLOYEE_SHIFT_MAP[String(employeeId)]?.name || 'Unknown';
-        await sendAttendanceTelegramByEmployeeId(
+        const sent = await sendAttendanceTelegramByEmployeeId(
             `🚨 <b>Break Time Exceeded</b>\n` +
             `👤 Name: ${name}\n` +
             `🆔 ID: ${employeeId}\n` +
@@ -1090,7 +1076,9 @@ async function runBreakOvertimeCheck() {
             `⚠️ ${name} is out of time on break (limit: ${BREAK_LIMIT_MIN} min)`,
             employeeId
         );
-        console.log(`🚨 SENT: break overtime alert — ${name} (${employeeId})`);
+        if (sent) {
+            console.log(`🚨 SENT: break overtime alert — ${name} (${employeeId})`);
+        }
     }
 }
 
