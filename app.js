@@ -8,9 +8,12 @@ const { google } = require('googleapis');
 // ====== CONFIG — CHANGE THESE ======
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const ATTENDANCE_CHAT_ROUTING_JSON = process.env.ATTENDANCE_CHAT_ROUTING_JSON || '';
 const PORT = Number(process.env.PORT || 8090);
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID || '';
 const GOOGLE_SHEET_NAME = process.env.GOOGLE_SHEET_NAME || 'Events';
+const GOOGLE_SHEET_SELECTED_ID = process.env.GOOGLE_SHEET_SELECTED_ID || '';
+const GOOGLE_SHEET_SELECTED_NAME = process.env.GOOGLE_SHEET_SELECTED_NAME || 'Selected Team';
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || '';
 const GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = (process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 const DEBUG_WEBHOOKS = false;
@@ -22,6 +25,29 @@ const BREAK_LIMIT_MIN = 60;
 const ON_TIME_GRACE_MIN = 10;
 const DIDNT_COME_AFTER_MIN = 120;
 // ===================================
+
+// ====== TELEGRAM ATTENDANCE ROUTING (OPTIONAL) ======
+// One bot token can send to multiple chats.
+// Add groups here OR via ATTENDANCE_CHAT_ROUTING_JSON env var.
+// Example:
+// [
+//   { chatId: '-1001111111111', employeeIds: ['001', '002'], employeeNames: ['Suxrob'] },
+//   { chatId: '-1002222222222', employeeIds: ['003'], employeeNames: [] }
+// ]
+const ATTENDANCE_CHAT_ROUTING = [
+    {
+        chatId: '-5221080452',
+        employeeNames: [
+            'Hasanboy',
+            'Akbar Ramadan',
+            'Farrux',
+            'Lazizbek Leo',
+            'Sardor',
+            'Azimjon'
+        ]
+    }
+];
+// ====================================================
 
 // ====== SHIFT SETUP (EDIT THIS BLOCK ONLY) ======
 const SHIFT_RULES = {
@@ -135,6 +161,10 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 async function sendTelegram(message) {
+    if (!TELEGRAM_CHAT_ID) {
+        console.warn('Telegram warning: TELEGRAM_CHAT_ID is empty, message skipped.');
+        return;
+    }
     try {
         await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -142,6 +172,119 @@ async function sendTelegram(message) {
         );
     } catch (err) {
         console.error('Telegram error:', err.message);
+    }
+}
+
+function normalizeForCompare(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function safeArray(values) {
+    if (!Array.isArray(values)) return [];
+    return values.map((v) => String(v || '').trim()).filter(Boolean);
+}
+
+function parseRoutingGroupsFromEnv(raw) {
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed;
+    } catch (err) {
+        console.error('Routing parse error (ATTENDANCE_CHAT_ROUTING_JSON):', err.message);
+        return [];
+    }
+}
+
+function buildAttendanceRoutingGroups() {
+    const merged = [
+        ...(Array.isArray(ATTENDANCE_CHAT_ROUTING) ? ATTENDANCE_CHAT_ROUTING : []),
+        ...parseRoutingGroupsFromEnv(ATTENDANCE_CHAT_ROUTING_JSON)
+    ];
+    return merged
+        .map((group) => ({
+            chatId: String(group?.chatId || '').trim(),
+            employeeIds: safeArray(group?.employeeIds),
+            employeeNames: safeArray(group?.employeeNames).map(normalizeForCompare)
+        }))
+        .filter((group) => group.chatId && (group.employeeIds.length > 0 || group.employeeNames.length > 0));
+}
+
+const attendanceRoutingGroups = buildAttendanceRoutingGroups();
+
+function getMatchedAttendanceRoutingGroups(employeeId, employeeName) {
+    const id = String(employeeId || '').trim();
+    const name = normalizeForCompare(employeeName);
+    return attendanceRoutingGroups.filter((group) => {
+        const matchesId = id && group.employeeIds.includes(id);
+        const matchesName = name && group.employeeNames.includes(name);
+        return matchesId || matchesName;
+    });
+}
+
+function resolveAttendanceChatIds(employeeId, employeeName) {
+    const targetChatIds = new Set();
+
+    for (const group of getMatchedAttendanceRoutingGroups(employeeId, employeeName)) {
+        targetChatIds.add(group.chatId);
+    }
+
+    if (targetChatIds.size > 0) return Array.from(targetChatIds);
+    // Fallback for non-routed employees is temporarily disabled.
+    // Re-enable later by uncommenting the next line.
+    // return TELEGRAM_CHAT_ID ? [TELEGRAM_CHAT_ID] : [];
+    return [];
+}
+
+function isSelectedAttendanceEmployee(employeeId, employeeName) {
+    return getMatchedAttendanceRoutingGroups(employeeId, employeeName).length > 0;
+}
+
+function getGoogleSheetTargetForEmployee(employeeId, employeeName) {
+    if (isSelectedAttendanceEmployee(employeeId, employeeName)) {
+        return {
+            spreadsheetId: GOOGLE_SHEET_SELECTED_ID || GOOGLE_SHEET_ID,
+            sheetName: GOOGLE_SHEET_SELECTED_NAME
+        };
+    }
+    return {
+        spreadsheetId: GOOGLE_SHEET_ID,
+        sheetName: GOOGLE_SHEET_NAME
+    };
+}
+
+async function sendAttendanceTelegram(message, employeeId, employeeName) {
+    const chatIds = resolveAttendanceChatIds(employeeId, employeeName);
+    if (chatIds.length === 0) {
+        console.warn(`Telegram warning: no target chat for ${employeeName || 'Unknown'} (${employeeId || 'Unknown'})`);
+        return;
+    }
+    for (const chatId of chatIds) {
+        try {
+            await axios.post(
+                `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+                { chat_id: chatId, text: message, parse_mode: 'HTML' }
+            );
+        } catch (err) {
+            console.error(`Telegram error (chat ${chatId}):`, err.message);
+        }
+    }
+}
+
+async function sendAttendanceTelegramByEmployeeId(message, employeeId) {
+    const fallbackName = EMPLOYEE_SHIFT_MAP[String(employeeId)]?.name || '';
+    await sendAttendanceTelegram(message, employeeId, fallbackName);
+}
+
+async function sendTelegramToChat(chatId, message) {
+    if (!chatId) return;
+    try {
+        await axios.post(
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+            { chat_id: chatId, text: message, parse_mode: 'HTML' }
+        );
+    } catch (err) {
+        console.error(`Telegram error (chat ${chatId}):`, err.message);
     }
 }
 
@@ -314,8 +457,8 @@ const statusAliases = {
 const recentEventCache = new Map();
 let lastWebhookSnapshot = null;
 let sheetsClientPromise = null;
-let googleSheetHeaderEnsured = false;
-let googleSheetTabEnsured = false;
+const googleSheetHeaderEnsuredKeys = new Set();
+const googleSheetTabEnsuredKeys = new Set();
 const GOOGLE_SHEET_HEADER = [
     // You can rename these column titles as you like.
     'Time Local',
@@ -334,9 +477,9 @@ function quoteSheetNameForRange(sheetName) {
     return `'${safe}'`;
 }
 
-function getHeaderRange() {
+function getHeaderRange(sheetName) {
     const endCol = String.fromCharCode('A'.charCodeAt(0) + GOOGLE_SHEET_HEADER.length - 1);
-    return `${quoteSheetNameForRange(GOOGLE_SHEET_NAME)}!A1:${endCol}1`;
+    return `${quoteSheetNameForRange(sheetName)}!A1:${endCol}1`;
 }
 
 function buildSheetRow({
@@ -368,10 +511,14 @@ function formatShiftTime(shift) {
 
 function isGoogleSheetsEnabled() {
     return Boolean(
-        GOOGLE_SHEET_ID &&
+        (GOOGLE_SHEET_ID || GOOGLE_SHEET_SELECTED_ID) &&
         GOOGLE_SERVICE_ACCOUNT_EMAIL &&
         GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
     );
+}
+
+function buildSheetEnsureKey(spreadsheetId, sheetName) {
+    return `${spreadsheetId}::${sheetName}`;
 }
 
 async function getGoogleSheetsClient() {
@@ -394,15 +541,18 @@ async function getGoogleSheetsClient() {
     return sheetsClientPromise;
 }
 
-async function appendEventToGoogleSheet(rowValues) {
+async function appendEventToGoogleSheet(rowValues, targetSheet = {}) {
     if (!isGoogleSheetsEnabled()) return;
+    const spreadsheetId = targetSheet.spreadsheetId || GOOGLE_SHEET_ID;
+    const sheetName = targetSheet.sheetName || GOOGLE_SHEET_NAME;
+    if (!spreadsheetId) return;
     try {
-        await ensureGoogleSheetHeader();
+        await ensureGoogleSheetHeader(spreadsheetId, sheetName);
         const sheets = await getGoogleSheetsClient();
         if (!sheets) return;
         await sheets.spreadsheets.values.append({
-            spreadsheetId: GOOGLE_SHEET_ID,
-            range: `${quoteSheetNameForRange(GOOGLE_SHEET_NAME)}!A2`,
+            spreadsheetId,
+            range: `${quoteSheetNameForRange(sheetName)}!A2`,
             valueInputOption: 'USER_ENTERED',
             requestBody: {
                 values: [rowValues]
@@ -413,54 +563,58 @@ async function appendEventToGoogleSheet(rowValues) {
     }
 }
 
-async function ensureGoogleSheetHeader() {
-    if (!isGoogleSheetsEnabled() || googleSheetHeaderEnsured) return;
+async function ensureGoogleSheetHeader(spreadsheetId, sheetName) {
+    if (!isGoogleSheetsEnabled() || !spreadsheetId || !sheetName) return;
+    const key = buildSheetEnsureKey(spreadsheetId, sheetName);
+    if (googleSheetHeaderEnsuredKeys.has(key)) return;
     try {
-        await ensureGoogleSheetTab();
+        await ensureGoogleSheetTab(spreadsheetId, sheetName);
         const sheets = await getGoogleSheetsClient();
         if (!sheets) return;
         const headerRes = await sheets.spreadsheets.values.get({
-            spreadsheetId: GOOGLE_SHEET_ID,
-            range: getHeaderRange()
+            spreadsheetId,
+            range: getHeaderRange(sheetName)
         });
         const firstRow = headerRes.data.values && headerRes.data.values[0] ? headerRes.data.values[0] : [];
         const hasHeader = firstRow.join('|') === GOOGLE_SHEET_HEADER.join('|');
         if (!hasHeader) {
             await sheets.spreadsheets.values.update({
-                spreadsheetId: GOOGLE_SHEET_ID,
-                range: getHeaderRange(),
+                spreadsheetId,
+                range: getHeaderRange(sheetName),
                 valueInputOption: 'RAW',
                 requestBody: {
                     values: [GOOGLE_SHEET_HEADER]
                 }
             });
         }
-        googleSheetHeaderEnsured = true;
+        googleSheetHeaderEnsuredKeys.add(key);
     } catch (err) {
         console.error('Google Sheets header setup error:', err.message);
     }
 }
 
-async function ensureGoogleSheetTab() {
-    if (!isGoogleSheetsEnabled() || googleSheetTabEnsured) return;
+async function ensureGoogleSheetTab(spreadsheetId, sheetName) {
+    if (!isGoogleSheetsEnabled() || !spreadsheetId || !sheetName) return;
+    const key = buildSheetEnsureKey(spreadsheetId, sheetName);
+    if (googleSheetTabEnsuredKeys.has(key)) return;
     try {
         const sheets = await getGoogleSheetsClient();
         if (!sheets) return;
         const meta = await sheets.spreadsheets.get({
-            spreadsheetId: GOOGLE_SHEET_ID,
+            spreadsheetId,
             fields: 'sheets.properties.title'
         });
         const titles = (meta.data.sheets || []).map((s) => s.properties?.title).filter(Boolean);
-        if (!titles.includes(GOOGLE_SHEET_NAME)) {
+        if (!titles.includes(sheetName)) {
             await sheets.spreadsheets.batchUpdate({
-                spreadsheetId: GOOGLE_SHEET_ID,
+                spreadsheetId,
                 requestBody: {
-                    requests: [{ addSheet: { properties: { title: GOOGLE_SHEET_NAME } } }]
+                    requests: [{ addSheet: { properties: { title: sheetName } } }]
                 }
             });
-            console.log(`📄 Created Google Sheet tab: ${GOOGLE_SHEET_NAME}`);
+            console.log(`📄 Created Google Sheet tab: ${sheetName}`);
         }
-        googleSheetTabEnsured = true;
+        googleSheetTabEnsuredKeys.add(key);
     } catch (err) {
         console.error('Google Sheets tab setup error:', err.message);
     }
@@ -665,6 +819,7 @@ async function handleEvent(data) {
     }
     const eventTime = parseEventTime(evt);
     const timeStr = formatDateTimeInZone(eventTime);
+    const targetSheet = getGoogleSheetTargetForEmployee(employeeId, employeeName);
     const shiftInfo = getEmployeeShift(employeeId);
     const configuredShift = shiftInfo && SHIFT_RULES[shiftInfo.shiftKey] ? SHIFT_RULES[shiftInfo.shiftKey] : null;
     const shiftDate = configuredShift ? resolveShiftDateForEvent(eventTime, configuredShift) : formatDateInZone(eventTime);
@@ -694,7 +849,7 @@ async function handleEvent(data) {
             action: 'Break In',
             shiftTime: formatShiftTime(configuredShift),
             shiftDate
-        }));
+        }), targetSheet);
         // Break notifications are intentionally disabled for now.
         // const duration = getBreakDuration(employeeId);
         // let message = `🔙 <b>Break In</b>\n${baseMessage}`;
@@ -711,7 +866,7 @@ async function handleEvent(data) {
             action: 'Break Out',
             shiftTime: formatShiftTime(configuredShift),
             shiftDate
-        }));
+        }), targetSheet);
         // Break notifications are intentionally disabled for now.
         // await sendTelegram(`☕ <b>Break Out</b>\n${baseMessage}`);
         // console.log(`✅ SENT: Break Out — ${employeeName} (${employeeId})`);
@@ -725,7 +880,7 @@ async function handleEvent(data) {
             employeeName,
             action: statusRawOriginal || checkType || 'Access Event',
             shiftDate
-        }));
+        }), targetSheet);
         // Unknown/unmapped users and generic access events are intentionally muted.
         // const fallbackStatus = statusMap[checkType] || status;
         // await sendTelegram(`${fallbackStatus.emoji} <b>${fallbackStatus.label}</b>\n${baseMessage}`);
@@ -775,7 +930,7 @@ async function handleEvent(data) {
         if (didntComeFlag) msg += `\n🚫 Marked as: <b>Did Not Come</b>\n⏱ Late by: <b>${lateMin} min</b>`;
         else if (lateFlag) msg += `\n🚨 Late by: <b>${lateMin} min</b>`;
         else msg += `\n🟢 On time (within ${ON_TIME_GRACE_MIN} min grace)`;
-        await sendTelegram(msg);
+        await sendAttendanceTelegram(msg, employeeId, employeeName);
         await appendEventToGoogleSheet(buildSheetRow({
             timeLocal: timeStr,
             employeeId,
@@ -785,7 +940,7 @@ async function handleEvent(data) {
             shiftDate,
             lateMinutes: lateMin,
             didntCome: didntComeFlag
-        }));
+        }), targetSheet);
         console.log(`✅ SENT: first check-in (${didntComeFlag ? 'did-not-come' : (lateFlag ? 'late' : 'on-time')}) — ${employeeName} (${employeeId})`);
         return;
     }
@@ -807,7 +962,7 @@ async function handleEvent(data) {
         if (dayRow && dayRow.first_check_in_at) {
             msg += `\n⏱ Worked: <b>${formatWorkedDuration(dayRow.first_check_in_at, eventTime, shiftDate, configuredShift)}</b>`;
         }
-        await sendTelegram(msg);
+        await sendAttendanceTelegram(msg, employeeId, employeeName);
         await appendEventToGoogleSheet(buildSheetRow({
             timeLocal: timeStr,
             employeeId,
@@ -815,7 +970,7 @@ async function handleEvent(data) {
             action: 'Check Out',
             shiftTime: formatShiftTime(configuredShift),
             shiftDate
-        }));
+        }), targetSheet);
         console.log(`✅ SENT: check-out — ${employeeName} (${employeeId})`);
         return;
     }
@@ -853,13 +1008,15 @@ async function runNoShowCheck() {
         `).run(employeeId, today, info.shiftKey);
 
         const name = info.name || 'Unknown';
-        await sendTelegram(
+        const targetSheet = getGoogleSheetTargetForEmployee(employeeId, name);
+        await sendAttendanceTelegramByEmployeeId(
             `🚫 <b>No Show Alert</b>\n` +
             `👤 Name: ${name}\n` +
             `🆔 ID: ${employeeId}\n` +
             `🏷 Shift: ${shift.label}\n` +
             `📅 Shift Date: ${today}\n` +
-            `⏱ No check-in received within ${DIDNT_COME_AFTER_MIN} minutes of shift start`
+            `⏱ No check-in received within ${DIDNT_COME_AFTER_MIN} minutes of shift start`,
+            employeeId
         );
         await appendEventToGoogleSheet(buildSheetRow({
             timeLocal: formatDateTimeInZone(now),
@@ -869,7 +1026,7 @@ async function runNoShowCheck() {
             shiftTime: formatShiftTime(shift),
             shiftDate: today,
             didntCome: true
-        }));
+        }), targetSheet);
         console.log(`🚫 SENT: no-show alert — ${name} (${employeeId})`);
     }
 }
@@ -914,12 +1071,13 @@ async function runBreakOvertimeCheck() {
         `).run(employeeId, lastBreakEvent.timestamp, now.toISOString());
 
         const name = lastBreakEvent.employee_name || EMPLOYEE_SHIFT_MAP[String(employeeId)]?.name || 'Unknown';
-        await sendTelegram(
+        await sendAttendanceTelegramByEmployeeId(
             `🚨 <b>Break Time Exceeded</b>\n` +
             `👤 Name: ${name}\n` +
             `🆔 ID: ${employeeId}\n` +
             `⏱ Out on break for: <b>${breakMinutes} min</b>\n` +
-            `⚠️ ${name} is out of time on break (limit: ${BREAK_LIMIT_MIN} min)`
+            `⚠️ ${name} is out of time on break (limit: ${BREAK_LIMIT_MIN} min)`,
+            employeeId
         );
         console.log(`🚨 SENT: break overtime alert — ${name} (${employeeId})`);
     }
@@ -992,9 +1150,36 @@ app.get('/debug-last-event', (req, res) => res.json(lastWebhookSnapshot || { mes
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Listener running on http://0.0.0.0:${PORT}`);
     console.log('Waiting for attendance events...\n');
-    sendTelegram('🟢 Attendance bot started and listening for events');
+    if (attendanceRoutingGroups.length > 0) {
+        const uniqueChats = new Set(attendanceRoutingGroups.map((g) => g.chatId));
+        if (TELEGRAM_CHAT_ID) uniqueChats.add(TELEGRAM_CHAT_ID);
+        for (const chatId of uniqueChats) {
+            sendTelegramToChat(chatId, '🟢 Attendance bot started and listening for events');
+        }
+    } else {
+        sendTelegram('🟢 Attendance bot started and listening for events');
+    }
     if (isGoogleSheetsEnabled()) {
-        ensureGoogleSheetHeader().then(() => {
+        const startupSheetTargets = [];
+        if (GOOGLE_SHEET_ID) {
+            startupSheetTargets.push({
+                spreadsheetId: GOOGLE_SHEET_ID,
+                sheetName: GOOGLE_SHEET_NAME
+            });
+        }
+        if (attendanceRoutingGroups.length > 0) {
+            const selectedTarget = {
+                spreadsheetId: GOOGLE_SHEET_SELECTED_ID || GOOGLE_SHEET_ID,
+                sheetName: GOOGLE_SHEET_SELECTED_NAME
+            };
+            const alreadyIncluded = startupSheetTargets.some(
+                (item) => item.spreadsheetId === selectedTarget.spreadsheetId && item.sheetName === selectedTarget.sheetName
+            );
+            if (!alreadyIncluded && selectedTarget.spreadsheetId) {
+                startupSheetTargets.push(selectedTarget);
+            }
+        }
+        Promise.all(startupSheetTargets.map((target) => ensureGoogleSheetHeader(target.spreadsheetId, target.sheetName))).then(() => {
             console.log('📄 Google Sheets logging is active.');
         }).catch((err) => {
             console.error('Google Sheets startup check error:', err.message);
