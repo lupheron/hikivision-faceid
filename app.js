@@ -112,6 +112,33 @@ const EMPLOYEE_SHIFT_MAP = {
     '32': { name: 'Zubayir', shiftKey: '6-3' },
     '036': { name: 'Odina', shiftKey: '6-3' }
 };
+
+// ====== EMPLOYEE SECRET KEYS ======
+// Each employee enters their secret key in the bot (/start) to register for
+// personal attendance DMs. Keep these private — share only with each employee.
+const EMPLOYEE_SECRET_KEYS = {
+    '001':  'spenceritdep',
+    '002':  'isaac26@',
+    '003':  'uks26@',
+    '004':  'akbar26@',
+    '0006': 'farrux26@',
+    '7':    'fayzulloh26@',
+    '8':    'diyor26@',
+    '9':    'fazliddin26@',
+    '10':   'asadbek26@',
+    '11':   'amirshoh26@',
+    '12':   'lazizbek26@',
+    '14':   'azizbek26@',
+    '19':   'jessica26@',
+    '24':   'sardor26@',
+    '27':   'nigora26@',
+    '20':   'humidullo26@',
+    '31':   'abdulloh26@',
+    '28':   'azimjon26@',
+    '32':   'zubayir26@',
+    '036':  'odina26@'
+};
+// ==================================
 // ================================================
 
 const app = express();
@@ -148,6 +175,14 @@ db.exec(`
     break_out_at TEXT NOT NULL,
     alerted_at TEXT NOT NULL,
     PRIMARY KEY(employee_id, break_out_at)
+  )
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS registered_users (
+    telegram_chat_id TEXT NOT NULL,
+    employee_id TEXT NOT NULL,
+    registered_at TEXT NOT NULL,
+    PRIMARY KEY(telegram_chat_id)
   )
 `);
 try {
@@ -292,6 +327,122 @@ async function sendTelegramToChat(chatId, message) {
         console.error(`Telegram error (chat ${chatId}):`, err.message);
     }
 }
+
+// Send a personal DM to the employee if they have registered via /start.
+// Handles leading-zero variations (e.g. device sends '1' but registered as '001').
+async function sendPersonalDm(employeeId, message) {
+    if (!employeeId) return;
+    const idStr = String(employeeId);
+    let row = db.prepare('SELECT telegram_chat_id FROM registered_users WHERE employee_id = ?').get(idStr);
+    if (!row) {
+        row = db.prepare(
+            'SELECT telegram_chat_id FROM registered_users WHERE CAST(employee_id AS INTEGER) = CAST(? AS INTEGER) AND employee_id != ?'
+        ).get(idStr, idStr);
+    }
+    if (!row) return;
+    await sendTelegramToChat(row.telegram_chat_id, message);
+}
+
+// ====== TELEGRAM BOT — PERSONAL REGISTRATION & COMMANDS ======
+const pendingKeyEntry = new Set();
+let pollingOffset = 0;
+
+async function handleTelegramUpdate(update) {
+    const msg = update.message || update.edited_message;
+    if (!msg || !msg.text) return;
+
+    const chatId = String(msg.chat.id);
+    const text = msg.text.trim();
+
+    if (text === '/start' || text.startsWith('/start ')) {
+        pendingKeyEntry.add(chatId);
+        await sendTelegramToChat(chatId,
+            '👋 <b>Welcome to the Attendance Bot!</b>\n\n' +
+            'To receive personal attendance notifications, enter your <b>secret key</b>:'
+        );
+        return;
+    }
+
+    if (text === '/mystatus') {
+        const reg = db.prepare('SELECT employee_id FROM registered_users WHERE telegram_chat_id = ?').get(chatId);
+        if (!reg) {
+            await sendTelegramToChat(chatId, '❌ You are not registered yet.\n\nUse /start to register with your secret key.');
+            return;
+        }
+        const empInfo = EMPLOYEE_SHIFT_MAP[reg.employee_id];
+        const shiftInfo = empInfo ? SHIFT_RULES[empInfo.shiftKey] : null;
+        await sendTelegramToChat(chatId,
+            `✅ <b>You are registered!</b>\n\n` +
+            `👤 Name: <b>${empInfo?.name || reg.employee_id}</b>\n` +
+            `🆔 Employee ID: ${reg.employee_id}\n` +
+            (shiftInfo ? `🏷 Shift: ${shiftInfo.label} (${shiftInfo.workStart}–${shiftInfo.workEnd})` : '')
+        );
+        return;
+    }
+
+    if (text === '/unregister') {
+        const deleted = db.prepare('DELETE FROM registered_users WHERE telegram_chat_id = ?').run(chatId);
+        if (deleted.changes > 0) {
+            await sendTelegramToChat(chatId, '✅ You have been unregistered and will no longer receive personal notifications.');
+        } else {
+            await sendTelegramToChat(chatId, 'ℹ️ You were not registered.');
+        }
+        return;
+    }
+
+    if (pendingKeyEntry.has(chatId)) {
+        pendingKeyEntry.delete(chatId);
+        const matchedId = Object.entries(EMPLOYEE_SECRET_KEYS).find(([, key]) => key === text)?.[0];
+        if (!matchedId) {
+            await sendTelegramToChat(chatId,
+                '❌ <b>Invalid key.</b>\n\nPlease ask your manager for the correct key, then use /start to try again.'
+            );
+            return;
+        }
+        db.prepare(`
+            INSERT INTO registered_users (telegram_chat_id, employee_id, registered_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_chat_id) DO UPDATE SET
+                employee_id = excluded.employee_id,
+                registered_at = excluded.registered_at
+        `).run(chatId, matchedId, new Date().toISOString());
+
+        const empInfo = EMPLOYEE_SHIFT_MAP[matchedId];
+        const shiftInfo = empInfo ? SHIFT_RULES[empInfo.shiftKey] : null;
+        await sendTelegramToChat(chatId,
+            `✅ <b>Registered successfully!</b>\n\n` +
+            `👤 You are now linked as: <b>${empInfo?.name || matchedId}</b>\n` +
+            (shiftInfo ? `🏷 Shift: ${shiftInfo.label} (${shiftInfo.workStart}–${shiftInfo.workEnd})\n` : '') +
+            `\nYou will receive a personal message every time your attendance is recorded. ` +
+            `Use /mystatus to check your registration or /unregister to remove it.`
+        );
+        console.log(`📲 Registered: ${empInfo?.name || matchedId} (${matchedId}) → chat ${chatId}`);
+        return;
+    }
+}
+
+async function startTelegramPolling() {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    console.log('📲 Telegram bot polling started (personal registration active).');
+    while (true) {
+        try {
+            const res = await axios.get(
+                `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`,
+                { params: { offset: pollingOffset, timeout: 30, allowed_updates: ['message'] }, timeout: 35000 }
+            );
+            for (const update of (res.data.result || [])) {
+                pollingOffset = update.update_id + 1;
+                handleTelegramUpdate(update).catch((err) =>
+                    console.error('Telegram update handler error:', err.message)
+                );
+            }
+        } catch (err) {
+            console.error('Telegram polling error:', err.message);
+            await new Promise((r) => setTimeout(r, 5000));
+        }
+    }
+}
+// =============================================================
 
 function normalizeGender(rawGender) {
     if (!rawGender) return 'Unknown';
@@ -922,6 +1073,7 @@ async function handleEvent(data) {
         else if (lateFlag) msg += `\n🚨 Late by: <b>${lateMin} min</b>`;
         else msg += `\n🟢 On time (within ${ON_TIME_GRACE_MIN} min grace)`;
         const sent = await sendAttendanceTelegram(msg, employeeId, employeeName);
+        await sendPersonalDm(employeeId, msg);
         if (sent) {
             await appendEventToGoogleSheet(buildSheetRow({
                 timeLocal: timeStr,
@@ -956,6 +1108,7 @@ async function handleEvent(data) {
             msg += `\n⏱ Worked: <b>${formatWorkedDuration(dayRow.first_check_in_at, eventTime, shiftDate, configuredShift)}</b>`;
         }
         const sent = await sendAttendanceTelegram(msg, employeeId, employeeName);
+        await sendPersonalDm(employeeId, msg);
         if (sent) {
             await appendEventToGoogleSheet(buildSheetRow({
                 timeLocal: timeStr,
@@ -1004,15 +1157,15 @@ async function runNoShowCheck() {
 
         const name = info.name || 'Unknown';
         const targetSheet = getGoogleSheetTargetForEmployee(employeeId, name);
-        const sent = await sendAttendanceTelegramByEmployeeId(
+        const noShowMsg =
             `🚫 <b>No Show Alert</b>\n` +
             `👤 Name: ${name}\n` +
             `🆔 ID: ${employeeId}\n` +
             `🏷 Shift: ${shift.label}\n` +
             `📅 Shift Date: ${today}\n` +
-            `⏱ No check-in received within ${VERY_LATE_AFTER_MIN} minutes of shift start`,
-            employeeId
-        );
+            `⏱ No check-in received within ${VERY_LATE_AFTER_MIN} minutes of shift start`;
+        const sent = await sendAttendanceTelegramByEmployeeId(noShowMsg, employeeId);
+        await sendPersonalDm(employeeId, noShowMsg);
         if (sent) {
             await appendEventToGoogleSheet(buildSheetRow({
                 timeLocal: formatDateTimeInZone(now),
@@ -1194,6 +1347,10 @@ setInterval(() => {
         console.error('No-show check error:', err.message);
     });
 }, NO_SHOW_CHECK_INTERVAL_MS);
+
+startTelegramPolling().catch((err) => {
+    console.error('Telegram polling fatal error:', err.message);
+});
 
 // Break overtime alert loop intentionally disabled for now.
 // setInterval(() => {
