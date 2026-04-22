@@ -92,6 +92,7 @@ const SHIFT_RULES = {
 // Example: '001': { name: 'Suxrob', shiftKey: '6-3' }
 const EMPLOYEE_SHIFT_MAP = {
     '001': { name: 'Suxrob', shiftKey: '6-3' },
+    '18': { name: 'Abdulaziz', shiftKey: '6-3' },
     '002': { name: 'Asadbek Odilov', shiftKey: '7-4' },
     '003': { name: 'Hasanboy', shiftKey: '5-2' },
     '004': { name: 'Akbar Ramadan', shiftKey: '5-2' },
@@ -118,6 +119,7 @@ const EMPLOYEE_SHIFT_MAP = {
 // receive personal attendance notifications. Change 'mykey123' per employee.
 const EMPLOYEE_SECRET_KEYS = {
     '001':  'spenceritdep',
+    '18':   'abdulaziz26@',
     '002':  'isaac26@',
     '003':  'uks26@',
     '004':  'akbar26@',
