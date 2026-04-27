@@ -2,6 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(grep -n \"//\" /c/hikvision-bot/app.js)"
+    ],
+    "additionalDirectories": [
+      "c:\\hikvision-personal",
+      "c:\\hikvision-kaisen",
+      "c:\\hikvision-other"
     ]
   }
 }
